@@ -23,12 +23,12 @@
 
 
 # Notes
-Please run the code in the sequence indicated by the numbers.
+1. Please run the code in the sequence indicated by the numbers.
 
-The raw scRNAseq data has been deposited to Gene Expression Omnibus (GEO) under accession number GSE154795.
+2. The raw scRNAseq data has been deposited to Gene Expression Omnibus (GEO) under accession number GSE154795.
 
-The scRNAseq mapped files can be generated using Cell Ranger version 3.0.0 or higher (10X Genomics) and aligned to the Genome Reference Consortium Human Build 38 (GRCh38).
+3. The scRNAseq mapped files can be generated using Cell Ranger version 3.0.0 or higher (10X Genomics) and aligned to the Genome Reference Consortium Human Build 38 (GRCh38).
 
-You can also replicate the analysis using the combined RDS file (GSE154795_GBM.AllCell.Integrated.Scaled.ClusterRes.0.1.rds.gz), which is also deposited at GEO under accession number GSE154795.
+4. You can also replicate the analysis using the combined RDS file (GSE154795_GBM.AllCell.Integrated.Scaled.ClusterRes.0.1.rds.gz), which is also deposited at GEO under accession number GSE154795.
 
-Requirements: R (tested with version 3.1.5).
+5. Requirements: R (tested with version 3.1.5).
