@@ -1,0 +1,282 @@
+
+#scRNAseq analysis of the combined tumor-infiltrating lymphocytes population
+#The raw data has be deposited to Gene Expression Omnibus under accession number GSE154795. 
+#The mapped files can be generated using Cell Ranger version 3.0.0 or higher (10X Genomics) and aligned to the Genome Reference Consortium Human Build 38 (GRCh38).
+#You can also run the analysis based the RDS file (GSE154795_GBM.AllCell.Integrated.Scaled.ClusterRes.0.1.rds.gz) which also depoited at GSE154795.
+
+```{r}
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(cowplot)
+library(readxl)
+
+rawDataDir = "GBM.RawData"
+
+##list of samples along with the path to their cellranger output
+sampleTable = "SampleList.GBM.Nov24.20.csv"
+
+##use raw matrix output and manually apply QC parameters
+Path10x = "outs/raw_feature_bc_matrix/"
+
+pctMitoCutoff = 0.2
+pctRiboCutoff = 0.4
+prefix = "AllCell"
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+```
+
+#Read the cellranger feature matrix files
+```{r}
+dirs <- read.csv(sampleTable)
+ID1 = rownames(dirs)
+
+ob.list = list()
+objectlist = c()
+
+drawPlot=0
+#i=1
+
+for (i in 1:length(ID1)){
+    sampleID <- as.character(dirs[i,2])
+    
+    path1 <- paste(rawDataDir,sampleID,Path10x,sep="/")
+    gbm <- Read10X(data.dir=path1) 
+    print(path1)
+  	
+    #each feature is supported by a min of 20 cells
+    gbm = gbm[rowSums(gbm != 0) >= 20,]
+	
+    #each cell has at least 200 features
+    gbm = gbm[,colSums(gbm != 0) >= 200]
+	
+	nUMI <- Matrix::colSums(gbm)
+	nGene <- Matrix::colSums(gbm != 0)
+	mito.genes <- grep(pattern = "^MT-", x = rownames(gbm), value = TRUE)
+	percent.mito <- Matrix::colSums(gbm[which(rownames(gbm) %in% mito.genes),])/Matrix::colSums(gbm)
+	  
+	ribosome.genes <- grep(pattern = "^RP[LS]", x = rownames(gbm), value = TRUE)
+	percent.ribo <- Matrix::colSums(gbm[which(rownames(gbm) %in% ribosome.genes),])/Matrix::colSums(gbm)
+	
+	if(drawPlot==1){
+  	  png(paste(sampleID,".UMI.pctMito.png",sep=""))
+	    plot(nUMI,percent.mito,xlab="nUMI",ylab="pctMito")
+	    dev.off()
+	  
+	    png(paste(sampleID,".UMI.pctRibo.png",sep=""))
+	    plot(nUMI,percent.ribo,xlab="nUMI",ylab="pctRibo")
+	    dev.off()
+	}
+	  
+	#apply percent.mito and percent.ribo cutoffs
+  	gbm = gbm[,percent.mito<=pctMitoCutoff & percent.ribo<=pctRiboCutoff] 
+	  
+	#downsample to max 10,000 cells per sample
+	if(ncol(gbm) > 10000){
+	    downsampleCols = sample(colnames(gbm),10000)
+	    gbm = gbm[,downsampleCols]
+	}
+	  
+	gbm.seurat <- CreateSeuratObject(counts = gbm, project = sampleID, min.cells = 20, min.features=200)
+	  
+	gbm.seurat$ID <- sampleID
+	gbm.seurat$condition <- as.character(dirs[i,3])
+	gbm.seurat$IDH_status = as.character(dirs[i,7])
+    gbm.seurat$MGMT = as.character(dirs[i,8])
+	  
+	gbm.seurat <- PercentageFeatureSet(gbm.seurat, pattern = "^MT-", col.name = "percent.mt")
+	gbm.seurat <- PercentageFeatureSet(gbm.seurat, pattern = "^RP[LS]", col.name = "percent.ribo")
+	  
+	gbm.seurat <- NormalizeData(object = gbm.seurat, verbose = TRUE)
+	  
+	#We assign scores in the CellCycleScoring function, which stores S and G2/M scores in object meta data, along with 
+	#the predicted classification of each cell in either G2M, S or G1 phase.
+	gbm.seurat <- CellCycleScoring(gbm.seurat, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE) 
+	gbm.seurat$CC.Difference <- gbm.seurat$S.Score-gbm.seurat$G2M.Score
+	gbm.seurat <- FindVariableFeatures(object = gbm.seurat, selection.method = "vst", nfeatures = 2000)
+	
+	ob.list = append(ob.list,gbm.seurat)
+	objectlist = c(objectlist,sampleID)
+	gc()
+}
+
+dirs$cellNumbers = sapply(ob.list, ncol)
+#saveRDS(ob.list,file=paste(prefix, "ObList.rds", sep="_"))
+```
+
+#Run Integration using Reference approach 
+#1:7 GBM.new    n=22,847
+#19:25 GBM.pembro  n=23,764
+#30:39 GBM.rec  n=20,113
+```{r}
+k.filterMax <- min(200, min(sapply(ob.list, ncol)))
+anchors <- FindIntegrationAnchors(object.list = ob.list, reference = c(1:7,19:25,30:39), k.filter = k.filterMax)
+#saveRDS(anchors,file=paste(prefix, "anchors.rds", sep="_"))
+gbm.combined <- IntegrateData(anchorset = anchors)
+DefaultAssay(object = gbm.combined) <- "integrated"
+#saveRDS(gbm.combined,file=paste(prefix, "integrated.rds", sep="_"))
+
+rm(anchors)
+rm(ob.list)
+gc()
+```
+
+#Scale data
+```{r}
+gbm.combined <- ScaleData(object = gbm.combined, verbose = TRUE, vars.to.regress = c("percent.mt","percent.ribo","nFeature_RNA","nCount_RNA","CC.Difference"))
+gbm.combined <- RunPCA(object = gbm.combined, npcs = 30, verbose = TRUE)
+
+gbm.combined$condition = factor(gbm.combined$condition,levels=c("GBM.new","GBM.rec","GBM.pembro"))
+#saveRDS(gbm.combined,file=paste(prefix, "scaled.PCA.rds", sep="_"))
+#gbm.combined = readRDS(file=paste(prefix, "scaled.PCA.rds", sep="_"))
+```
+
+#Run UMAP for cluster visualization
+```{r}
+minDist = 0.2
+spread1 = 2
+NN = 20
+seedUse = 122
+epoch = 1000
+
+gbm.combined <- RunUMAP(object = gbm.combined, reduction = "pca", dims = 1:30,min.dist = minDist, spread=spread1, n.neighbors=NN, seed.use = seedUse, n.epochs=epoch) 
+prefix1 = paste(prefix,".MinD",minDist,".sprd",spread1,".NN",NN,".seed",seedUse,".ep",epoch,sep="")
+
+outfile = paste(prefix1,"_UMAP.nUMI.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+FeaturePlot(object = gbm.combined, features = c("nCount_RNA"), min.cutoff = "q9", pt.size = 2) #umi plot
+dev.off()
+
+outfile = paste(prefix1,"_UMAP.nGene.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+FeaturePlot(object = gbm.combined, features = c("nFeature_RNA"), min.cutoff = "q9", pt.size = 2) #umi plot
+dev.off()
+
+outfile = paste(prefix1,"_UMAP.pctRibo.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+FeaturePlot(object = gbm.combined, features = c("percent.ribo"), min.cutoff = "q9", pt.size = 2) #umi plot
+dev.off()
+
+outfile = paste(prefix1,"_UMAP.pctMito.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+FeaturePlot(object = gbm.combined, features = c("percent.mt"), min.cutoff = "q9", pt.size = 2) #umi plot
+dev.off()
+
+outfile = paste(prefix1,"_UMAP.treatment.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", split.by = "condition", pt.size = 1, ncol=2)
+dev.off()
+
+#saveRDS(gbm.combined,file=paste(prefix1, ".rds", sep=""))
+```
+
+#Visualize known cell markers
+```{r}
+outfile = paste(prefix,"_UMAP.MainCellTypes1.png",sep="")
+png(filename = outfile,width = 1200, height = 900)
+FeaturePlot(object = gbm.combined, features = c("CD3D","CD14","HLA-DRA","S100A8","CLEC9A","SOX2","GFAP","P2RY12","OLIG1"), min.cutoff = "q9",  pt.size = 0.5, ncol=3, cols = c("lightgrey","red"))
+dev.off()
+```
+
+#Cluster by PCA
+```{r}
+gbm.combined <- FindNeighbors(object = gbm.combined, reduction = "pca", dims = 1:30, nn.method = "annoy", annoy.metric = "cosine", force.recalc = TRUE)
+gbm.combined <- FindClusters(gbm.combined, resolution = 0.1)
+
+DefaultAssay(gbm.combined) <- "RNA"
+Idents(object = gbm.combined) <- "integrated_snn_res.0.1"
+cluster.markers<- FindAllMarkers(object = gbm.combined, only.pos = TRUE, min.pct = 0.25,logfc.threshold = 0.585)
+outfile = paste(prefix,"_ClusterDiffGene.Res0.1.csv",sep="")
+write.csv(cluster.markers, file=outfile)
+```
+
+Annotate each cluster with celltype
+```{r}
+Idents(object = gbm.combined) <- "integrated_snn_res.0.1"
+current.cluster.ids <- c(0:15)
+new.cluster.ids <- c("Myeloid-mphage-DC","LowRead","Myeloid-mono","Tumor-normal","Lymphoid","Dying",rep("Unknown",10))
+Idents(object = gbm.combined) <- plyr::mapvalues(x = Idents(object = gbm.combined), from = current.cluster.ids, to = new.cluster.ids)
+
+###### Percentage of each celltype in each sample ###########################################
+gbm.combined@meta.data$celltype <- Idents(object = gbm.combined)
+gbm.combined@meta.data$celltype <- factor(gbm.combined@meta.data$celltype, 
+                                                 levels = 
+                                              c("Myeloid-mphage-DC","Myeloid-mono",
+                                                "Lymphoid","Tumor-normal",
+                                                "Dying","LowRead","Unknown")) 
+
+head(gbm.combined@meta.data)
+gbm.combined$celltype
+
+saveRDS(gbm.combined,file=paste(prefix, "res.0.1.withAnnot.rds", sep="_"))
+gbm.combined <- readRDS(file=paste(prefix, "res.0.1.withAnnot.rds", sep="_"))
+```
+
+
+```{r}
+library(colorspace)
+library(scales)
+colorsCluster = qualitative_hcl(7)
+
+#show_col(colors)
+
+outfile = paste(prefix,"_UMAP.Res0.1.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "celltype", label = TRUE, label.size = 8, pt.size = 1, cols = colorsCluster)
+dev.off()
+
+outfile = paste(prefix,"_UMAP.Res0.1.noLabel.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "celltype", label = FALSE, label.size = 8, pt.size = 1, cols = colorsCluster)
+dev.off()
+
+Idents(object = gbm.combined) <- "celltype"
+cluster.markers<- FindAllMarkers(object = gbm.combined, only.pos = TRUE, min.pct = 0.25,logfc.threshold = 0.585,test.use="MAST")
+outfile = paste(prefix,"_ClusterDiffGene.Res0.1.byCelltype.csv",sep="")
+write.csv(cluster.markers, file=outfile)
+```
+
+Get DEG based on tumor group (New vs Recur vs Recur+aPD1)
+```{r}
+DefaultAssay(gbm.combined)<-"RNA"
+celltypes = c("Myeloid-mphage-DC","Myeloid-mono","Lymphoid",
+              "Tumor-normal","Dying","LowRead")
+i=1
+
+for (i in 1:length(celltypes)){
+  celltype1 = celltypes[i]
+  
+  TreatmentSubset = subset(gbm.combined,subset = (celltype == celltype1))
+  Idents(object = TreatmentSubset) <- "condition"
+  markers <- FindAllMarkers(TreatmentSubset,min.pct = 0.25, logfc.threshold = 0.585)
+  markers <- as.data.frame(markers)
+  markers$diff = markers$pct.1 - markers$pct.2
+  markers$celltype = celltype1
+  
+  #outfile = paste(prefix,"DEG",celltype1,".GBM.pembroVsNone.csv",sep=".")
+  outfile = paste(prefix,"DEG","GBM.AllCellbyType.tsv",sep=".")
+  write.table(markers, file=outfile, sep="\t", col.names = !file.exists(outfile),append=TRUE)
+}
+```
+
+## Write the files into separate immune populations for subset analysis
+```{r}
+ids = rownames(subset(gbm.combined@meta.data,celltype %in% c("Lymphoid")))
+subsetObject = subset(gbm.combined, cells = ids)
+saveRDS(subsetObject,file=paste(prefix, "Lymphoid.rds", sep="_"))
+
+ids = rownames(subset(gbm.combined@meta.data,celltype %in% c("Myeloid-mphage-DC","Myeloid-mono")))
+subsetObject = subset(gbm.combined, cells = ids)
+saveRDS(subsetObject,file=paste(prefix, "Myeloid.rds", sep="_"))
+```
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,230 @@
+```{r}
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(monocle) 
+
+
+### load data #################################################
+#Monocle can work with relative expression values (e.g. FPKM or TPM units) or absolute transcript 
+#counts (e.g. from UMI experiments). Monocle also works "out-of-the-box" with the transcript count 
+#matrices produced by CellRanger
+
+prefix = "Monocle.CD8T"
+infile = "Lymphoid_TcellOnly.ForMonocle.rds"
+TRUST4_TCR = "TRUST4.nClone.txt"
+T_subset = "CD8T"
+source("AuxFunctions.R")
+```
+
+```{r}
+gbm.combined <- readRDS(file=infile)
+DefaultAssay(object = gbm.combined) <- "RNA"
+Idents(gbm.combined) <- "celltype"
+
+Exprlist = gbm.combined@assays$RNA@counts["CD14",]+gbm.combined@assays$RNA@counts["CD68",]
+Exprlist2 = gbm.combined@assays$RNA@counts["CD8A",]+gbm.combined@assays$RNA@counts["CD8B",]
+Exprlist3 = gbm.combined@assays$RNA@counts["CD3D",]+gbm.combined@assays$RNA@counts["CD3E",]+gbm.combined@assays$RNA@counts["CD3G",]
+Exprlist4 = gbm.combined@assays$RNA@counts["CD4",]
+
+
+## cells with CD8 T cell markers and without myeloid markers and CD4 T markers (CD8 only)
+cellToKeep = names(Exprlist[Exprlist < 1 & Exprlist2 >= 1 & Exprlist3 >= 1 & Exprlist4 < 1])
+
+gbm.combined = subset(gbm.combined, cells = cellToKeep) 
+table(gbm.combined$condition)
+
+#get the most variable genes as the ordering genes
+gbm.combined <- FindVariableFeatures(object=gbm.combined , selection.method = "vst", nfeatures = 1000) 
+```
+
+```{r}
+##get the normalized expr matrix
+data <- gbm.combined@assays$RNA@data
+
+TCRtable <- read.table(TRUST4_TCR,sep="\t",header=T,row.names = 1)
+TCRtable$ID_TCR <- rownames(TCRtable)
+TCRtable <- TCRtable[cellToKeep,c(2,3)]
+
+gbm.combined <- AddMetaData(gbm.combined,TCRtable,col.name=c('clone.size','tcr_cell_id'))
+m1 = gbm.combined@meta.data
+
+pd <- new('AnnotatedDataFrame', data = gbm.combined@meta.data)
+
+fData <- data.frame(gene_short_name = row.names(data), row.names = row.names(data))
+fd <- new('AnnotatedDataFrame', data = fData)
+
+my_cds <- newCellDataSet(data,
+                         phenoData = pd,
+                         featureData = fd,
+                         expressionFamily = uninormal())
+                        # already normalized and scaled in Seurat
+
+#Run ordering filter algorithm
+var_genes <- gbm.combined@assays$RNA@var.features
+ordering_genes <- var_genes
+my_cds <- setOrderingFilter(my_cds, ordering_genes = ordering_genes)
+
+rm(pd)
+rm(fData)
+rm(fd)
+rm(data)
+rm(gbm.combined)
+gc()
+```
+
+#Reduce dimension - do not normalize or include pseudo count. Use monocle scaling
+```{r}
+maxComp <- 5
+my_cds <- reduceDimension(my_cds, max_components = maxComp,
+                          num_dim = 30,
+                          norm_method="none", 
+                          reduction_method = 'DDRTree',
+                          verbose = TRUE,
+                          scaling=TRUE,
+                          pseudo_expr=0,
+                          check_duplicates = FALSE)
+
+
+print(dim(exprs(my_cds)))
+my_cds <- orderCells2(my_cds)
+
+outfile <- paste(prefix,"_",T_subset,"_","CDs_sub.comp.",maxComp,".rds",sep="")
+saveRDS(my_cds,file=outfile)
+```
+
+```{r}
+outfile = paste(prefix,"_",T_subset,"_","TrajByCluster.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+plot_cell_trajectory(my_cds, color_by = "seurat_clusters")
+dev.off()
+
+#"facet" the trajectory plot so it's easier to see where each of the states are located
+outfile = paste(prefix,"_",T_subset,"_","TrajByClusterFacet.png",sep="")
+png(filename = outfile,width = 1200, height = 1200)
+plot_cell_trajectory(my_cds, color_by = "seurat_clusters") + facet_wrap(~seurat_clusters, nrow = 3)
+dev.off()
+
+condition_level = c("GBM.new","GBM.rec","GBM.PD1")
+pData(my_cds)$condition = factor(pData(my_cds)$condition, levels=condition_level)
+colors <- c("blue","black","red")
+
+outfile = paste(prefix,"_",T_subset,"_","TrajByConditionFacet.png",sep="")
+png(filename = outfile,width = 1200, height = 1200)
+plot_cell_trajectory(my_cds, color_by = "condition",cell_size = 4) + facet_wrap(~condition, nrow = 3) + scale_color_manual(values = colors)
+dev.off()
+
+outfile = paste(prefix,"_",T_subset,"_","TrajByCondition.png",sep="")
+png(filename = outfile,width = 1200, height = 1200)
+plot_cell_trajectory(my_cds, color_by = "condition",cell_size = 4)+ scale_color_manual(values = colors)
+dev.off()
+
+outfile = paste(prefix,"_",T_subset,"_","TrajByState.png",sep="")
+png(filename = outfile,width = 1200, height = 1200)
+plot_cell_trajectory(my_cds, color_by = "State")+ facet_wrap(~State, nrow = 4)
+dev.off()
+
+outfile = paste(prefix,"_",T_subset,"_","TrajByPseudotime.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+plot_cell_trajectory(my_cds, color_by = "Pseudotime",show_branch_points=TRUE)
+dev.off()
+
+outfile = paste(prefix,"_",T_subset,"_","TrajByUMI.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+plot_cell_trajectory(my_cds, color_by = "nFeature_RNA",show_branch_points=TRUE)
+dev.off()
+
+outfile = paste(prefix,"_",T_subset,"_","TCRClone.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+plot_cell_trajectory(my_cds, color_by = "clone.size",show_branch_points=TRUE,cell_size = 3, shape=21)+
+#geom_point(aes(size = clone.size))
+#+
+scale_colour_gradient(low = "#56b4e9", high = "maroon",na.value = alpha("grey",0.2))
+dev.off()
+
+Brc=c(1,2,9,7,8,15,14,13)
+BrcName=factor(c("1","2","9","7","8","15","14","13"),
+               levels=c("1","2","9","7","8","15","14","13"))
+```
+
+
+#Finding Genes that Change as a Function of Pseudotime ##########################
+```{r}
+my_pseudotime_de <- differentialGeneTest(my_cds,
+                                         fullModelFormulaStr = "~sm.ns(Pseudotime)",
+                                         cores = 5)
+my_pseudotime_de <- my_pseudotime_de[order(my_pseudotime_de$qval),]
+
+outfile = paste(prefix,"_",T_subset,"_","DiffGenebyPseudotime.txt",sep="")
+write.table(my_pseudotime_de,file=outfile,sep="\t")
+
+
+#plot the top genes
+gene_to_cluster1 <- as.character(my_pseudotime_de.sub$gene_short_name) 
+
+outfile = paste(prefix,"_",T_subset,"_","Pseudotime.Heatmap.png",sep="")
+png(filename = outfile,width = 800, height = 1000)
+my_pseudotime_heatmap <- plot_pseudotime_heatmap(my_cds[gene_to_cluster1,],
+                        num_clusters = 5,
+                        cores = 4,
+                        show_rownames = T,
+                        return_heatmap = TRUE)
+dev.off()
+
+my_pseudotime_heatmap$tree_row
+t <- as.data.frame(cutree(my_pseudotime_heatmap$tree_row, k=5))
+colnames(t) <- "Cluster"
+t$Gene <- rownames(t)
+outfile = paste(prefix,"_",DataType,"_","Pseudotime.Heatmap.ClusterGene.txt",sep="")
+write.table(t,file=outfile,sep="\t")
+
+outfile = paste(prefix,"_",T_subset,"_","Pseudotime.Top100DEG.Heatmap.Branch.png",sep="")
+png(filename = outfile,width = 600, height = 2000)
+my_pseudotime_heatmap.branched <- plot_multiple_branches_heatmap(my_cds[gene_to_cluster1,],
+                              branches=Brc,
+                              branches_name=BrcName,
+                              show_rownames=T,
+                              cluster_rows=TRUE,
+                              num_clusters=5,
+                              #norm_method = "vstExprs",
+                              return_heatmap = TRUE)
+dev.off()
+
+```
+
+Plot specific genes related to known CD8 populations
+```{r}
+gene_to_cluster <- c("PDCD1","GZMB","KLRB1","GZMK","CCL5",
+            "CX3CR1","LAG3","PRF1","TOX","TNFRSF9",
+            "TBX21","EOMES","IFNG","ICOS","CTLA4",
+            "IL7R","TCF7","CCR7","LEF1","MKI67",
+            #"SELL",
+            "CXCL9","CXCL10","HAVCR2","BATF","CXCR6",
+            "SLAMF6","BACH2","XCL1","CXCL13",
+            #"TIGIT",
+            "STAT1","IRF1","ENTPD1",
+            #"NEAT1","MIAT",
+            #"GATA3","RORC","CXCR5",
+            "CD69","NCAM1"
+            #,"ITGAE"
+            )
+
+outfile = paste(prefix,"_",T_subset,"_","Pseudotime.SelectMarkers.Heatmap.png",sep="")
+png(filename = outfile,width = 900, height = 900)
+my_pseudotime_heatmap.branched <- plot_multiple_branches_heatmap(my_cds[gene_to_cluster,],
+                              branches=Brc,
+                              branches_name=BrcName,
+                              show_rownames=T,
+                              cluster_rows=TRUE,
+                              num_clusters=6,
+                              #norm_method = "vstExprs",
+                              return_heatmap = TRUE)
+dev.off()
+
+table(my_cds$condition,my_cds$State)
+
+```
+
+
+
+

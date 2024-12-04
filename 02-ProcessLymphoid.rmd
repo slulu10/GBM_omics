@@ -1,0 +1,326 @@
+```{r}
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(cowplot)
+#library(MAST)
+#library(readxl)
+
+options(bitmapType='cairo') 
+prefix = "Lymphoid"
+
+infile = "AllCell_Lymphoid.rds" 
+
+source("AuxFunctions.R")
+```
+
+```{r}
+gbm.combined=readRDS(file=infile)
+DefaultAssay(object = gbm.combined) <- "RNA" 
+
+#split the combined object into a list
+ob.list1<-SplitObject(gbm.combined,split.by= "orig.ident")
+ob.list = list()
+objectlist = c()
+condlist = c()
+minCells = 30
+
+genesFiltered <- cleanGeneNames(rownames(gbm.combined))
+
+for (i in 1:length(ob.list1)){
+
+    test = ob.list1[[i]]
+    test = subset(test, features = genesFiltered)
+    dim(test)
+    
+    test = subset(test, subset = nFeature_RNA >= 100)
+    dim(test)
+    
+  	if(ncol(test) >= minCells){ 
+  	  
+  	  m = test@meta.data
+  	  print(m$orig.ident[[1]])
+  	  test@meta.data = m[,1:12]
+  	  test@reductions=list()
+  	  test@commands=list()
+  	  test@tools=list()
+  	  test@assays$integrated=list()
+  	  test <- NormalizeData(object = test, verbose = TRUE)
+	    test  <- FindVariableFeatures(object = test , selection.method = "vst", nfeatures = 2000) 
+	    
+    	ob.list = append(ob.list,test)
+    	objectlist = append(objectlist,m$orig.ident[[1]])
+    	condlist = append(condlist,as.character(m$condition[[1]]))
+  	}
+}
+
+cellNumbers = sapply(ob.list, ncol)
+table1 = data.frame(ID=objectlist,Cond = condlist, cellNumber = cellNumbers)
+write.csv(table1,file=paste(prefix,"cellNumbers.csv",sep="."))
+#saveRDS(ob.list,file=paste(prefix, "ObList.rds", sep="_"))
+```
+
+```{r}
+ob.list1 = ob.list[c(1:5,14:17,28:32)]
+ob.list2 = ob.list[c(6:9,18:22,33:35)]
+ob.list3 = ob.list[c(10:13,23:27,36:40)]
+
+library(future)
+library(future.apply)
+plan("multiprocess", workers = 4)
+options(future.globals.maxSize = 20 * 1024^3)
+k.filterMax <- min(200, min(sapply(ob.list3, ncol)))
+anchors3 <- FindIntegrationAnchors(object.list = ob.list3, k.filter = k.filterMax, anchor.features = 2000)
+gbm.combined3 <- IntegrateData(anchorset = anchors3)
+rm(anchors3)
+k.filterMax <- min(200, min(sapply(ob.list1, ncol)))
+anchors1 <- FindIntegrationAnchors(object.list = ob.list1, k.filter = k.filterMax, anchor.features = 2000)
+gbm.combined1 <- IntegrateData(anchorset = anchors1)
+rm(anchors1)
+k.filterMax <- min(200, min(sapply(ob.list2, ncol)))
+anchors2 <- FindIntegrationAnchors(object.list = ob.list2, k.filter = k.filterMax, anchor.features = 2000)
+gbm.combined2 <- IntegrateData(anchorset = anchors2)
+rm(anchors2)
+
+ob.list = list(gbm.combined1,gbm.combined2,gbm.combined3)
+k.filterMax <- min(200, min(sapply(ob.list, ncol)))
+
+library(future)
+library(future.apply)
+plan("multiprocess", workers = 4)
+options(future.globals.maxSize = 20 * 1024^3)
+
+anchors <- FindIntegrationAnchors(object.list = ob.list, k.filter = k.filterMax, anchor.features = 2000)
+saveRDS(anchors,file=paste(prefix, "anchors.rds", sep="_"))
+rm(ob.list)
+rm(gbm.combined1)
+rm(gbm.combined2)
+rm(gbm.combined3)
+gc()
+```
+
+##re-integrate
+```{r}
+plan("multiprocess", workers = 1)
+#anchors <- readRDS(file=paste(prefix, "anchors.rds", sep="_"))
+
+gbm.combined <- IntegrateData(anchorset = anchors)
+DefaultAssay(object = gbm.combined) <- "integrated"
+
+#saveRDS(gbm.combined,file=paste(prefix, "integrated.rds", sep="_"))
+rm(anchors)
+gc()
+
+```
+
+##Scale data
+```{r}
+plan("multiprocess", workers = 4)
+options(future.globals.maxSize = 20000 * 1024^2)
+gbm.combined <- ScaleData(object = gbm.combined, verbose = TRUE, vars.to.regress = c("percent.mt","percent.ribo","nFeature_RNA","nCount_RNA","CC.Difference"))
+gbm.combined <- RunPCA(object = gbm.combined, npcs = 30, verbose = TRUE)
+
+gbm.combined$condition = factor(gbm.combined$condition,levels=c("GBM.new","GBM.rec","GBM.PD1"))
+
+#saveRDS(gbm.combined,file=paste(prefix, "scaled.PCA.rds", sep="_"))
+#gbm.combined = readRDS(file=paste(prefix, "scaled.PCA.rds", sep="_"))
+```
+
+```{r}
+minDist = 0.2
+spread1 = 5
+NN = 20
+seedUse = 222
+epoch = 1000
+
+gbm.combined <- RunUMAP(object = gbm.combined, reduction = "pca", dims = 1:30,min.dist = minDist, spread=spread1, n.neighbors=NN, seed.use = seedUse, n.epochs=epoch) #, min.dist = 0.1, n.neighbors=10, seed.use = 22, n.epochs=500)
+prefix1 = paste(prefix,".MinD",minDist,".sprd",spread1,".NN",NN,".seed",seedUse,".ep",epoch,sep="")
+
+outfile = paste(prefix1,"_UMAP.byBatch.png",sep="")
+png(filename = outfile,width = 800, height = 1200)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "condition", pt.size = 1)
+dev.off()
+
+outfile = paste(prefix1,"_UMAP.nUMI.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+FeaturePlot(object = gbm.combined, features = c("nCount_RNA"), min.cutoff = "q9", pt.size = 2) #umi plot
+dev.off()
+
+outfile = paste(prefix1,"_UMAP.nGene.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+FeaturePlot(object = gbm.combined, features = c("nFeature_RNA"), min.cutoff = "q9", pt.size = 2) #umi plot
+dev.off()
+
+outfile = paste(prefix1,"_UMAP.treatment.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", split.by = "condition", pt.size = 1, ncol=2)
+dev.off()
+
+#saveRDS(gbm.combined,file=paste(prefix1, ".rds", sep="_"))
+#gbm.combined <- readRDS(file=paste(prefix1, ".rds", sep="_"))
+```
+
+```{r}
+outfile = paste(prefix,"_UMAP.MainCellTypes.png",sep="")
+png(filename = outfile,width = 1200, height = 800)
+FeaturePlot(object = gbm.combined, features = c("CD3D","GZMA","CD8A","CD4","HLA-DQA1","PDCD1","CTLA4","FOXP3",
+                                                "MKI67"), min.cutoff = "q9",  pt.size = 0.5, ncol=3, cols = c("lightgrey","red"))
+dev.off()
+
+outfile = paste(prefix,"_UMAP.MainCellTypes2.png",sep="")
+png(filename = outfile,width = 1200, height = 800)
+FeaturePlot(object = gbm.combined, features = c("CD14","FCGR3A","XCL1","LILRA4","CD160","IL7R","SELL","CCL5",
+                                                "CD274"), min.cutoff = "q9",  pt.size = 0.5, ncol=3, cols = c("lightgrey","red"))
+dev.off()
+```
+
+```{r}
+DefaultAssay(gbm.combined) <- "integrated"
+
+gbm.combined <- FindNeighbors(object = gbm.combined, reduction = "pca", dims = 1:30, nn.method = "annoy", annoy.metric = "cosine", force.recalc = TRUE)
+gbm.combined <- FindClusters(gbm.combined, resolution = 0.5)
+
+colors = c("lightgrey","red","orange","yellow","green","blue","magenta","cyan","pink","brown","black","darkblue","purple","darkgreen","navyblue","maroon")
+
+#gbm.combined$integrated_snn_res.0.5 = factor(gbm.combined$integrated_snn_res.0.5,levels=c(as.character(0:11)))
+outfile = paste(prefix,"_UMAP.Res0.5.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "integrated_snn_res.0.5", label = TRUE, label.size = 8, pt.size = 1,cols = colors[1:9])
+dev.off()
+
+outfile = paste(prefix,"_UMAP.Res0.5.noLabel.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "integrated_snn_res.0.5", label = FALSE, label.size = 8, pt.size = 1,cols = colors[1:9])
+dev.off()
+
+outfile = paste(prefix,"_UMAP.Res0.5.split.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", split.by = "integrated_snn_res.0.5", label = FALSE, pt.size = 0.5, ncol=3,cols = colors[1:9])
+dev.off()
+
+gbm.combined <- FindClusters(gbm.combined, resolution = 0.7)
+gbm.combined$integrated_snn_res.0.7 = factor(gbm.combined$integrated_snn_res.0.7,levels=c(as.character(0:10)))
+outfile = paste(prefix,"_UMAP.Res0.7.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "integrated_snn_res.0.7", label = TRUE, label.size = 8, pt.size = 1,cols = colors[1:11])
+dev.off()
+
+outfile = paste(prefix,"_UMAP.Res0.7.noLabel.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "integrated_snn_res.0.7", label = FALSE, label.size = 8, pt.size = 1,cols = colors[1:11])
+dev.off()
+
+outfile = paste(prefix,"_UMAP.Res0.7.split.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", split.by = "integrated_snn_res.0.7", label = FALSE, pt.size = 0.5, ncol=3,cols = colors[1:11])
+dev.off()
+```
+
+```{r}
+#saveRDS(gbm.combined,file=paste(prefix, "cluster.res.0.5.to.0.7.rds", sep="_"))
+#gbm.combined <- readRDS(file="GBM.Lymphoid.Dec7.2020_cluster.res.0.5.to.0.7.rds")
+
+library(future)
+library(future.apply)
+
+##get the cluster markers
+DefaultAssay(gbm.combined) <- "RNA"
+
+Idents(object = gbm.combined) <- "integrated_snn_res.0.7"
+plan("multiprocess", workers = 4)
+options(future.globals.maxSize = 20000 * 1024^2)
+cluster.markers<- FindAllMarkers(object = gbm.combined, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.322)
+outfile = paste(prefix,"_ClusterDiffGene.Res0.7.log.322.csv",sep="")
+write.csv(cluster.markers, file=outfile)
+```
+
+
+```{r}
+Idents(object = gbm.combined) <- "integrated_snn_res.0.7"
+current.cluster.ids <- c(0:10)
+new.cluster.ids <- c("L2-IL7R-CD69-CD40L.T","L1-GZMK.CD8A.T","L+M-1","L+M-2","Dying","L5-XCL1-GZMA-NKG7","L6-Proliferating","L+M-3","L4-Treg","L3-IL7R-TOX-TCF7.T","L7-pDC-Bcells")
+Idents(object = gbm.combined) <- plyr::mapvalues(x = Idents(object = gbm.combined), from = current.cluster.ids, to = new.cluster.ids)
+
+###### Percentage of each celltype in each sample ###########################################
+gbm.combined@meta.data$celltype <- Idents(object = gbm.combined)
+gbm.combined@meta.data$celltype <- factor(gbm.combined@meta.data$celltype, 
+                                                 levels = c("L1-GZMK.CD8A.T","L2-IL7R-CD69-CD40L.T","L3-IL7R-TOX-TCF7.T","L4-Treg","L5-XCL1-GZMA-NKG7","L6-Proliferating","L7-pDC-Bcells","L+M-1","L+M-2","L+M-3","Dying")) #so that each sample will have the same number clusters tablized (even no cells from that cluster)
+
+library(colorspace)
+library(scales)
+colorsCluster = c(divergingx_hcl(10,palette="TealRose"),"grey50")
+colorsCluster[3] <- "green3"
+colorsCluster[4] <- "darkgreen"
+colorsCluster[6] <- "purple3"
+colorsCluster[7] <- "cyan3"
+colorsCluster[9] <- "maroon"
+
+#show_col(colors)
+Idents(object = gbm.combined) <- "celltype"
+DefaultAssay(gbm.combined) <- "RNA"
+
+outfile = paste(prefix,"_UMAP.res.0.7.byCellType.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "celltype", label = TRUE, label.size = 8, pt.size = 1,cols = colorsCluster)
+dev.off()
+
+outfile = paste(prefix,"_UMAP.res.0.7.noLabel.byCellType.png",sep="")
+png(filename = outfile,width = 800, height = 800)
+DimPlot(object = gbm.combined, reduction = "umap", group.by = "celltype", label = FALSE, label.size = 8, pt.size = 1,cols = colorsCluster)
+dev.off()
+
+#saveRDS(gbm.combined,file=paste(prefix, "res.0.7.withAnnot.rds", sep="_"))
+gbm.combined <- readRDS(file=paste(prefix, "res.0.7.withAnnot.rds", sep="_"))
+```
+
+For suppl table
+```{r}
+cluster.markers<- FindAllMarkers(object = gbm.combined, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.322)
+outfile = paste(prefix,"_ClusterDiffGene.Res0.7.logFC.322.byCelltype.csv",sep="")
+write.csv(cluster.markers, file=outfile)
+```
+
+
+Save the T cells without Tregs, proliferating cells and L+M doublets for Monocle pseudotime analysis
+```{r}
+ids = rownames(subset(gbm.combined@meta.data,celltype %in% c("L1-GZMK.CD8A.T","L2-IL7R-CD69-CD40L.T","L3-IL7R-TOX-TCF7.T","L5-XCL1-GZMA-NKG7")))
+subsetObject = subset(gbm.combined, cells = ids)
+saveRDS(subsetObject,file=paste(prefix, "TcellOnly.ForMonocle.rds", sep="_"))
+
+ids = rownames(subset(gbm.combined@meta.data,celltype %in% c("L1-GZMK.CD8A.T","L2-IL7R-CD69-CD40L.T","L3-IL7R-TOX-TCF7.T","L5-XCL1-GZMA-NKG7","L6-Proliferating")))
+subsetObject = subset(gbm.combined, cells = ids)
+saveRDS(subsetObject,file=paste(prefix, "TcellOnlyWithProlif.ForMonocle.rds", sep="_"))
+
+```
+
+Get DEGs by conditions for each lymphoid clusters
+```{r}
+DefaultAssay(gbm.combined)<-"RNA"
+celltypes = c("L1-GZMK.CD8A.T","L2-IL7R-CD69-CD40L.T","L3-IL7R-TOX-TCF7.T","L4-Treg","L5-XCL1-GZMA-NKG7","L6-Proliferating","L7-pDC-Bcells","Dying")
+i=1
+geneSet = c()
+
+for (i in 1:length(celltypes)){
+  celltype1 = celltypes[i]
+  
+  TreatmentSubset = subset(gbm.combined,subset = (celltype == celltype1))
+  Idents(object = TreatmentSubset) <- "condition"
+  markers <- FindAllMarkers(TreatmentSubset,min.pct = 0.25, logfc.threshold = 0.322,only.pos = TRUE)
+  markers <- as.data.frame(markers)
+  markers$diff = markers$pct.1 - markers$pct.2
+  markers$celltype = celltype1
+  
+  geneSet = union(geneSet,rownames(markers))
+  outfile = paste(prefix,"DEG","GBM.byType.v2.tsv",sep=".")
+  write.table(markers, file=outfile, sep="\t", col.names = !file.exists(outfile),append=TRUE)
+}
+```
+
+
+
+
+
+
+
+
+
